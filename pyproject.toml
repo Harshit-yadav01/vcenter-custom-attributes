@@ -1,0 +1,19 @@
+[project]
+name = "vcattr"
+version = "0.1.0"
+description = "Back up vCenter custom attributes and restore them on a secondary vCenter"
+requires-python = ">=3.10"
+dependencies = ["pyvmomi>=8.0.1"]
+
+[project.scripts]
+vcattr = "vcattr.cli:main"
+
+[tool.setuptools]
+packages = ["vcattr"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
