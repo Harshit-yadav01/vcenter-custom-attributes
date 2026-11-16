@@ -20,6 +20,9 @@ python -m venv .venv
 
 This gives you the `vcattr` command (or run `python -m vcattr`).
 
+For the Windows lab command history, explanations, and pending recovery steps,
+see the [PowerShell command guide](./POWERSHELL-COMMANDS.md).
+
 ## Password
 
 The password is never taken on the command line. Set `VCENTER_PASSWORD` (or the variable named by
