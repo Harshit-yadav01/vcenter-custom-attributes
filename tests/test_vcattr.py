@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from vcattr import vcenter
-from vcattr.cli import build_parser, cmd_apply
+from vcattr.cli import build_parser, cmd_apply, main
 from vcattr.core import (
     CONFLICT,
     CREATE,
@@ -217,3 +217,90 @@ def test_apply_plan_creates_fields_then_sets_values():
     assert manager.set_calls == [("ref-web", 100, "ops")]
     assert result.set == 1
     assert result.errors == ["VirtualMachine db01: set Owner: boom"]
+
+
+def test_single_vm_backup_selects_path_and_excludes_other_fields(monkeypatch, tmp_path):
+    source = snap("primary", [FieldDef("Owner", None), FieldDef("Other", None)], [
+        vm("RHEL8", {"Owner": "ops"}, path="DC/vm/A/RHEL8"),
+        vm("RHEL8", {"Other": "keep"}, path="DC/vm/B/RHEL8"),
+        vm("empty"),
+    ])
+    wire_snapshots(monkeypatch, {"primary": source})
+    output = tmp_path / "source.json"
+    args = ["backup", "--vcenter", "primary", "--user", "user", "--out", str(output)]
+    assert main([*args, "--vm", "RHEL8"]) == 2
+    assert main([*args, "--vm", "missing"]) == 2
+    assert not output.exists()
+    assert main([*args, "--vm", "DC/vm/A/RHEL8"]) == 0
+    backup = Snapshot.load(output)
+    assert backup.vm_scoped
+    assert [f.name for f in backup.fields] == ["Owner"]
+    assert [(o.path, o.values) for o in backup.objects] == [("DC/vm/A/RHEL8", {"Owner": "ops"})]
+    assert main([*args, "--vm", "empty"]) == 0
+    backup = Snapshot.load(output)
+    assert backup.vm_scoped and backup.fields == []
+    assert backup.objects[0].name == "empty" and backup.objects[0].values == {}
+
+
+def wire_snapshots(monkeypatch, snapshots):
+    monkeypatch.setenv("VCENTER_PASSWORD", "test-password")
+    managers = {host: FakeManager() for host in snapshots}
+    monkeypatch.setattr(vcenter, "connect", lambda host, *_: SimpleNamespace(
+        RetrieveContent=lambda: SimpleNamespace(customFieldsManager=managers[host]),
+    ))
+    monkeypatch.setattr(vcenter, "disconnect", lambda _: None)
+    monkeypatch.setattr(vcenter, "read_snapshot", lambda _si, host, _types: snapshots[host])
+    return managers
+
+
+def test_single_vm_failover_previews_and_only_writes_selected_vm(monkeypatch, tmp_path, capsys):
+    field = FieldDef("Owner", None, key=7)
+    source_vm = vm("RHEL8", {"Owner": "ops"})
+    source = snap("primary", [field], [source_vm])
+    original = tmp_path / "original.json"
+    source.for_vm(source_vm).save(original)
+    target = snap("secondary", [field], [
+        vm("RHEL8", ref="not-selected"),
+        vm("recovered", {"Owner": "previous"}, path="DC/vm/A/recovered", ref="selected"),
+        vm("recovered", path="DC/vm/B/recovered", ref="same-name"),
+    ])
+    manager = wire_snapshots(monkeypatch, {"secondary": target})["secondary"]
+    args = ["failover", "--vcenter", "secondary", "--user", "user", "--backup", str(original),
+            "--backup-dir", str(tmp_path), "--overwrite"]
+    assert main([*args, "--apply", "--yes"]) == 2
+    assert main([*args, "--vm", "recovered", "--apply", "--yes"]) == 2
+    assert main([*args, "--vm", "DC/vm/A/recovered"]) == 0
+    assert "Destination VM: DC/vm/A/recovered" in capsys.readouterr().out
+    assert manager.set_calls == []
+    assert main([*args, "--vm", "DC/vm/A/recovered", "--apply", "--yes"]) == 0
+    assert manager.set_calls == [("selected", 7, "ops")]
+    safety = Snapshot.load(next(tmp_path.glob("secondary-before-failover-*.json")))
+    assert safety.vm_scoped
+    assert [(o.path, o.values) for o in safety.objects] == [
+        ("DC/vm/A/recovered", {"Owner": "previous"}),
+    ]
+
+
+@pytest.mark.parametrize("use_latest,expected", [(False, "ops"), (True, "updated")])
+def test_single_vm_failback_only_restores_original_vm(monkeypatch, tmp_path, use_latest, expected):
+    field = FieldDef("Owner", None, key=7)
+    original_vm = vm("RHEL8", {"Owner": "ops"}, path="DC/vm/A/RHEL8")
+    original_vm.instance_uuid = "original-id"
+    original = tmp_path / "original.json"
+    snap("primary", [field], [original_vm]).for_vm(original_vm).save(original)
+    recovered_vm = vm("recovered", {"Owner": "updated"})
+    latest = tmp_path / "latest.json"
+    snap("secondary", [field], [recovered_vm]).for_vm(recovered_vm).save(latest)
+    restored_vm = vm("RHEL8", {"Owner": "before"}, path=original_vm.path, ref="original")
+    restored_vm.instance_uuid = "replacement-id"
+    primary = snap("primary", [field], [restored_vm, vm("RHEL8", ref="same-name")])
+    manager = wire_snapshots(monkeypatch, {"primary": primary})["primary"]
+    args = ["restore", "--user", "user", "--backup", str(latest if use_latest else original),
+            "--original-backup", str(original), "--backup-dir", str(tmp_path),
+            "--overwrite", "--apply", "--yes"]
+    assert main([*args, "--vcenter", "secondary"]) == 2
+    assert main([*args, "--vcenter", "primary"]) == 2
+    assert manager.set_calls == []
+    restored_vm.instance_uuid = "original-id"
+    assert main([*args, "--vcenter", "primary"]) == 0
+    assert manager.set_calls == [("original", 7, expected)]

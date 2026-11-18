@@ -32,6 +32,12 @@ Use `--insecure` if the vCenter has a self-signed certificate.
 
 ## Disaster recovery workflow
 
+To move custom-attribute values for just one VM, use `backup --vm` and
+`failover --vm`. On failback, `restore --original-backup` identifies the original
+VM while `--backup` selects which values to restore. See the
+[single-VM PowerShell workflow](./POWERSHELL-COMMANDS.md#single-vm-backup-failover-and-failback)
+for commands and safeguards. The site-wide workflow below remains available.
+
 ### 1. Take backups regularly, while the primary is up
 
 ```bash

@@ -6,10 +6,13 @@ import argparse
 import getpass
 import os
 import sys
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
 from vcattr.core import Snapshot, build_plan, load_name_map, resolve_types
+
+VM_TYPES = {"VirtualMachine"}
 
 DESCRIPTION = """\
 Back up vCenter custom attributes and put them back on another vCenter.
@@ -81,14 +84,22 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("backup", help="back up custom attributes from a vCenter")
     _add_connection(p)
     p.add_argument("--out", type=Path, help="output file (default backups/<vcenter>-<time>.json)")
+    p.add_argument("--vm", help="back up only this VM (exact name or full inventory path)")
 
     p = sub.add_parser("failover", help="apply a primary backup to the secondary vCenter")
     _add_connection(p)
     _add_apply(p)
+    p.add_argument("--vm", help="apply a single-VM backup to this exact VM name or inventory path")
 
     p = sub.add_parser("restore", help="apply a backup to a vCenter (for example after failback)")
     _add_connection(p)
     _add_apply(p)
+    destination = p.add_mutually_exclusive_group()
+    destination.add_argument("--vm", help="apply a single-VM backup to this exact VM name or inventory path")
+    destination.add_argument(
+        "--original-backup", type=Path,
+        help="single-VM backup identifying the original VM to restore to",
+    )
 
     p = sub.add_parser("show", help="print what a backup file contains")
     p.add_argument("backup", type=Path)
@@ -112,16 +123,26 @@ def _safe(host: str) -> str:
     return "".join(c if c.isalnum() or c in "-." else "_" for c in host)
 
 
+def _vm_types(types: set[str] | None) -> set[str]:
+    if types is not None and types != VM_TYPES:
+        raise ValueError("Single-VM operations only support --types vm.")
+    return VM_TYPES
+
+
 def cmd_backup(args) -> int:
     from vcattr import vcenter
 
     types = resolve_types(args.types)
+    if args.vm is not None:
+        types = _vm_types(types)
     si = vcenter.connect(
         args.vcenter, args.user, _password(args.password_env, args.user, args.vcenter),
         args.port, args.insecure,
     )
     try:
         snap = vcenter.read_snapshot(si, args.vcenter, types).filtered(types)
+        if args.vm is not None:
+            snap = snap.for_vm(snap.select_vm(args.vm))
     finally:
         vcenter.disconnect(si)
     out = args.out or Path("backups") / f"{_safe(args.vcenter)}-{_stamp()}.json"
@@ -138,6 +159,20 @@ def cmd_apply(args) -> int:
     from vcattr import vcenter
 
     types = resolve_types(args.types)
+    original_path = getattr(args, "original_backup", None)
+    vm_mode = args.vm is not None or original_path is not None
+    original_vm = None
+    if vm_mode:
+        types = _vm_types(types)
+        if args.name_map is not None or args.backup is None:
+            raise ValueError("Single-VM operations require --backup and cannot use --name-map.")
+    if original_path is not None:
+        original = Snapshot.load(original_path)
+        if not original.vm_scoped:
+            raise ValueError("--original-backup must point to a backup created with backup --vm.")
+        if args.vcenter.casefold() != original.vcenter.casefold():
+            raise ValueError(f"--original-backup identifies vCenter {original.vcenter!r}, not {args.vcenter!r}.")
+        original_vm = original.objects[0]
     if args.source_vcenter:
         if not args.source_user:
             raise ValueError("--source-user is required when using --source-vcenter")
@@ -154,7 +189,14 @@ def cmd_apply(args) -> int:
             f"Source: {args.source_vcenter} (read live at {backup.taken_at})"
         )
     else:
-        backup = Snapshot.load(args.backup).filtered(types)
+        backup = Snapshot.load(args.backup)
+        if backup.vm_scoped != vm_mode:
+            raise ValueError(
+                "A single-VM backup requires --vm (or restore --original-backup)."
+                if backup.vm_scoped else
+                "Back up the selected VM with backup --vm before using single-VM mode."
+            )
+        backup = backup.filtered(types)
         source_description = f"Backup: {args.backup} (taken {backup.taken_at} from {backup.vcenter})"
     name_map = load_name_map(args.name_map)
 
@@ -164,6 +206,22 @@ def cmd_apply(args) -> int:
     )
     try:
         target = vcenter.read_snapshot(si, args.vcenter, types)
+        safety_snapshot = target
+        if vm_mode:
+            if original_vm is not None:
+                selected = target.select_vm(original_vm.path, path_only=True)
+                if original_vm.instance_uuid and selected.instance_uuid != original_vm.instance_uuid:
+                    raise ValueError(
+                        f"VM at {selected.path!r} does not have the original instance UUID. "
+                        "Verify its identity before selecting it explicitly with --vm."
+                    )
+            else:
+                selected = target.select_vm(args.vm)
+            print(f"Backup VM: {backup.objects[0].path}")
+            print(f"Destination VM: {selected.path}")
+            name_map = {("VirtualMachine", backup.objects[0].name): selected.name}
+            target = replace(target, objects=[selected])
+            safety_snapshot = target.for_vm(selected)
         plan = build_plan(backup, target, overwrite=args.overwrite, name_map=name_map)
         print(source_description)
         print(plan.to_text(verbose=args.verbose))
@@ -193,7 +251,7 @@ def cmd_apply(args) -> int:
                 return 1
 
         safety = args.backup_dir / f"{_safe(args.vcenter)}-before-{args.command}-{_stamp()}.json"
-        target.save(safety)
+        safety_snapshot.save(safety)
         print(f"Saved the target's current attributes to {safety} (use it with restore to undo).")
 
         result = vcenter.apply_plan(si, plan, target)
@@ -216,12 +274,15 @@ def cmd_show(args) -> int:
     snap = Snapshot.load(args.backup)
     print(f"vCenter:  {snap.vcenter} ({snap.about})")
     print(f"Taken:    {snap.taken_at}")
+    if snap.vm_scoped:
+        print(f"VM scope: {snap.objects[0].path}")
     print(f"Attributes ({len(snap.fields)}):")
     for f in snap.fields:
         used = sum(1 for o in snap.objects if f.name in o.values)
         print(f"  {f.name}  [{f.type or 'Global'}]  on {used} object(s)")
-    print(f"Objects with values ({len(snap.objects)}):")
-    for o in snap.objects:
+    with_values = [o for o in snap.objects if o.values]
+    print(f"Objects with values ({len(with_values)}):")
+    for o in with_values:
         vals = ", ".join(f"{k}={v}" for k, v in sorted(o.values.items()))
         print(f"  {o.type} {o.path}: {vals}")
     return 0

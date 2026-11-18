@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 FORMAT_VERSION = 1
+VM_FORMAT_VERSION = 2
 
 # Friendly names accepted by --types, mapped to vSphere managed object type names.
 TYPE_ALIASES = {
@@ -80,10 +81,11 @@ class Snapshot:
     fields: list[FieldDef]
     objects: list[EntityRecord]
     about: str = ""
+    vm_scoped: bool = False
 
     def to_dict(self) -> dict:
         return {
-            "format": FORMAT_VERSION,
+            "format": VM_FORMAT_VERSION if self.vm_scoped else FORMAT_VERSION,
             "vcenter": self.vcenter,
             "about": self.about,
             "taken_at": self.taken_at,
@@ -91,17 +93,18 @@ class Snapshot:
             "objects": [
                 {k: v for k, v in asdict(o).items() if k != "ref"}
                 for o in self.objects
-                if o.values
+                if o.values or self.vm_scoped
             ],
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> Snapshot:
-        if data.get("format") != FORMAT_VERSION:
+        version = data.get("format")
+        if version not in (FORMAT_VERSION, VM_FORMAT_VERSION):
             raise ValueError(
-                f"Unsupported backup format {data.get('format')!r}; expected {FORMAT_VERSION}."
+                f"Unsupported backup format {version!r}; expected {FORMAT_VERSION} or {VM_FORMAT_VERSION}."
             )
-        return cls(
+        snapshot = cls(
             vcenter=data.get("vcenter", ""),
             about=data.get("about", ""),
             taken_at=data.get("taken_at", ""),
@@ -117,7 +120,13 @@ class Snapshot:
                 )
                 for o in data.get("objects", [])
             ],
+            vm_scoped=version == VM_FORMAT_VERSION,
         )
+        if snapshot.vm_scoped and (
+            len(snapshot.objects) != 1 or snapshot.objects[0].type != "VirtualMachine"
+        ):
+            raise ValueError("A single-VM backup must contain exactly one VM.")
+        return snapshot
 
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -136,6 +145,33 @@ class Snapshot:
             taken_at=self.taken_at,
             fields=[f for f in self.fields if f.type is None or f.type in types],
             objects=[o for o in self.objects if o.type in types],
+            vm_scoped=self.vm_scoped,
+        )
+
+    def select_vm(self, selector: str, *, path_only: bool = False) -> EntityRecord:
+        matches = [
+            obj for obj in self.objects
+            if obj.type == "VirtualMachine"
+            and (obj.path == selector or (not path_only and obj.name == selector))
+        ]
+        if not matches:
+            raise ValueError(f"{self.vcenter}: no VM matches {selector!r}.")
+        if len(matches) > 1:
+            paths = ", ".join(obj.path for obj in matches)
+            raise ValueError(
+                f"{self.vcenter}: VM selector {selector!r} is ambiguous ({paths}); "
+                "use the full inventory path."
+            )
+        return matches[0]
+
+    def for_vm(self, vm: EntityRecord) -> Snapshot:
+        return Snapshot(
+            vcenter=self.vcenter,
+            taken_at=self.taken_at,
+            fields=[f for f in self.fields if f.name in vm.values],
+            objects=[vm],
+            about=self.about,
+            vm_scoped=True,
         )
 
 
@@ -272,6 +308,7 @@ def build_plan(
 
     target_fields = {f.name: f for f in target.fields}
     usable_fields: dict[str, str | None] = {}
+    conflicting_fields = set()
     for f in backup.fields:
         existing = target_fields.get(f.name)
         if existing is None:
@@ -284,7 +321,10 @@ def build_plan(
             plan.fields.append(FieldAction(
                 f.name, f.type, CONFLICT, f"target defines it for {existing.type or 'Global'}",
             ))
-            usable_fields[f.name] = existing.type
+            if backup.vm_scoped:
+                conflicting_fields.add(f.name)
+            else:
+                usable_fields[f.name] = existing.type
 
     by_name: dict[tuple[str, str], list[EntityRecord]] = {}
     for obj in target.objects:
@@ -322,7 +362,9 @@ def build_plan(
         tgt = candidates[0]
         for fname, value in sorted(obj.values.items()):
             old = tgt.values.get(fname, "")
-            if fname not in usable_fields:
+            if fname in conflicting_fields:
+                action, detail = SKIP, "attribute definition conflicts with the target"
+            elif fname not in usable_fields:
                 action, detail = SKIP, "attribute is not defined in the backup"
             elif not field_applies(usable_fields[fname], obj.type):
                 action, detail = SKIP, f"attribute on the target is for {usable_fields[fname]}"

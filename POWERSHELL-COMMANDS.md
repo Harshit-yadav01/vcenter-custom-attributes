@@ -27,6 +27,70 @@ Python 3.10 or newer is required. Do not copy PowerShell prompt text such as
 
 No commands in this guide automatically recover VMs through SRM.
 
+## Single-VM backup, failover, and failback
+
+Use this workflow when values should be copied only from and to VMs you select.
+These commands describe the new workflow, not the site-wide lab runs recorded
+above. Use the updated tool on both sites. It still reads older site-wide
+backups, but you must create a new backup with `--vm` for single-VM operations.
+
+After setup, enter the source/target vCenter and username variables as described
+in [section 3](#3-enter-connection-details), then select the original VM:
+
+```powershell
+$sourceVm = Read-Host "Enter the original VM's exact name or full inventory path"
+.\.venv\Scripts\python.exe -m vcattr backup --vcenter $sourceVcenter --user $sourceUser --vm $sourceVm --out .\backups\original-vm.json
+.\.venv\Scripts\python.exe -m vcattr show .\backups\original-vm.json
+```
+
+The JSON contains only the selected VM and definitions for its populated values.
+Keep this original file at the recovery site; do not overwrite it with a later
+target backup. If multiple VMs share a name, use the full inventory path shown
+in the error, such as `DC/vm/Folder/RHEL8`.
+
+Once SRM has recovered the VM at the target, select that VM explicitly and preview:
+
+```powershell
+$targetVm = Read-Host "Enter the recovered VM's exact name or full inventory path"
+.\.venv\Scripts\python.exe -m vcattr failover --vcenter $targetVcenter --user $targetUser --backup .\backups\original-vm.json --vm $targetVm
+```
+
+If `Destination VM` is correct, repeat with `--apply` and confirm when prompted.
+A missing or ambiguous destination is rejected before any definitions or values
+are written. Global definition names can still appear on other VMs; **only the
+selected destination VM receives values**. No name-map CSV is needed.
+
+For failback, choose which values to restore:
+
+- **Original values:** use the original source backup.
+- **Latest target values:** before taking the recovered VM offline or moving it
+  back, save its current values to a separate file.
+
+```powershell
+# Only for latest target values
+.\.venv\Scripts\python.exe -m vcattr backup --vcenter $targetVcenter --user $targetUser --vm $targetVm --out .\backups\target-vm-latest.json
+```
+
+When the original VM is available again, set `$valuesBackup` to one of the
+two files, then preview the restore:
+
+```powershell
+$valuesBackup = ".\backups\original-vm.json"
+# To restore latest target values, set $valuesBackup to ".\backups\target-vm-latest.json" instead.
+.\.venv\Scripts\python.exe -m vcattr restore --vcenter $sourceVcenter --user $sourceUser --backup $valuesBackup --original-backup .\backups\original-vm.json
+```
+
+`--original-backup` checks the original vCenter address, VM inventory path, and
+instance UUID when present in the backup. Use the same vCenter address you used
+to take the original backup. If SRM changed the original VM's path or UUID,
+verify the recovered VM's identity in vSphere Client, then use `--vm` with its
+verified exact inventory path **instead of** `--original-backup`.
+
+After reviewing the restore preview, repeat with `--apply`. To replace differing
+values, include `--overwrite` in both the preview and apply. Restoring a backup
+does not delete values or definitions that are absent from it. These examples
+verify vCenter certificates by default; see section 3 for the lab certificate option.
+
 ## 1. Download the project and create the environment
 
 Run once from a folder where you want the project stored:
