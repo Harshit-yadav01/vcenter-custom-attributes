@@ -190,6 +190,7 @@ class FakeManager:
     def __init__(self, fail_on=None):
         self.field = []
         self.set_calls = []
+        self.removed_keys = []
         self.fail_on = fail_on
 
     def AddCustomFieldDef(self, name, moType):
@@ -201,6 +202,10 @@ class FakeManager:
         if entity == self.fail_on:
             raise RuntimeError("boom")
         self.set_calls.append((entity, key, value))
+
+    def RemoveCustomFieldDef(self, key):
+        self.removed_keys.append(key)
+        self.field = [f for f in self.field if f.key != key]
 
 
 def test_apply_plan_creates_fields_then_sets_values():
@@ -217,6 +222,26 @@ def test_apply_plan_creates_fields_then_sets_values():
     assert manager.set_calls == [("ref-web", 100, "ops")]
     assert result.set == 1
     assert result.errors == ["VirtualMachine db01: set Owner: boom"]
+
+
+def test_remove_global_definitions_removes_only_requested_global_fields():
+    manager = FakeManager()
+    manager.field = [
+        SimpleNamespace(name="Owner", key=7, managedObjectType=None),
+        SimpleNamespace(name="Rack", key=8, managedObjectType=None),
+        SimpleNamespace(name="HostOnly", key=9, managedObjectType=object()),
+    ]
+    si = SimpleNamespace(RetrieveContent=lambda: SimpleNamespace(customFieldsManager=manager))
+
+    result = vcenter.remove_global_definitions(
+        si, ["Owner", "NotPresent", "HostOnly"], progress=lambda _message: None,
+    )
+
+    assert result.removed == ["Owner"]
+    assert result.missing == ["NotPresent"]
+    assert result.errors == ["remove attribute HostOnly: target definition is not Global"]
+    assert manager.removed_keys == [7]
+    assert [f.name for f in manager.field] == ["Rack", "HostOnly"]
 
 
 def test_single_vm_backup_selects_path_and_excludes_other_fields(monkeypatch, tmp_path):
@@ -304,3 +329,84 @@ def test_single_vm_failback_only_restores_original_vm(monkeypatch, tmp_path, use
     restored_vm.instance_uuid = "original-id"
     assert main([*args, "--vcenter", "primary"]) == 0
     assert manager.set_calls == [("original", 7, expected)]
+
+
+def test_failback_deletes_only_backup_global_definitions_after_success(
+    monkeypatch, tmp_path, capsys,
+):
+    field = FieldDef("Owner", None, key=7)
+    original_vm = vm("RHEL8", {"Owner": "old"}, path="DC/vm/A/RHEL8")
+    original_vm.instance_uuid = "original-id"
+    original = tmp_path / "original.json"
+    snap("primary", [field], [original_vm]).for_vm(original_vm).save(original)
+
+    recovered_vm = vm("recovered", {"Owner": "latest"})
+    latest = tmp_path / "latest.json"
+    snap("secondary", [field], [recovered_vm]).for_vm(recovered_vm).save(latest)
+
+    source_vm = vm("RHEL8", {"Owner": "before"}, path=original_vm.path, ref="source-ref")
+    source_vm.instance_uuid = "original-id"
+    source = snap("primary", [field], [source_vm])
+    target_vm = vm("recovered", {"Owner": "latest"}, path="DR/vm/recovered", ref="target-ref")
+    target = snap(
+        "secondary",
+        [field, FieldDef("KeepMe", None, key=8)],
+        [target_vm, vm("unrelated", {"Owner": "keep"}, ref="other-ref")],
+    )
+
+    snapshots = {"primary": source, "secondary": target}
+    managers = wire_snapshots(monkeypatch, snapshots)
+    managers["secondary"].field = [
+        SimpleNamespace(name="Owner", key=7, managedObjectType=None),
+        SimpleNamespace(name="KeepMe", key=8, managedObjectType=None),
+    ]
+    monkeypatch.setenv("VCENTER_CLEANUP_PASSWORD", "cleanup-password")
+
+    args = [
+        "restore", "--vcenter", "primary", "--user", "restore-user",
+        "--backup", str(latest), "--original-backup", str(original),
+        "--delete-target-definitions", "--cleanup-vcenter", "secondary",
+        "--cleanup-user", "cleanup-user", "--cleanup-insecure",
+        "--backup-dir", str(tmp_path), "--overwrite",
+    ]
+    assert main([*args]) == 0
+    assert managers["primary"].set_calls == []
+    assert managers["secondary"].removed_keys == []
+    assert "WARNING: deleting a Global definition" in capsys.readouterr().out
+
+    assert main([*args, "--apply", "--yes"]) == 0
+    assert managers["primary"].set_calls == [("source-ref", 7, "latest")]
+    assert managers["secondary"].removed_keys == [7]
+    assert [f.name for f in managers["secondary"].field] == ["KeepMe"]
+    saved_target = Snapshot.load(next(tmp_path.glob("secondary-before-definition-cleanup-*.json")))
+    assert len(saved_target.objects) == 2
+    assert saved_target.objects[1].values == {"Owner": "keep"}
+
+
+def test_failback_cleanup_does_not_run_if_source_restore_has_problems(
+    monkeypatch, tmp_path,
+):
+    field = FieldDef("Owner", None, key=7)
+    original_vm = vm("RHEL8", {"Owner": "old"}, path="DC/vm/A/RHEL8")
+    original = tmp_path / "original.json"
+    snap("primary", [field], [original_vm]).for_vm(original_vm).save(original)
+    latest = tmp_path / "latest.json"
+    snap("secondary", [field], [vm("recovered", {"Owner": "latest"})]).for_vm(
+        vm("recovered", {"Owner": "latest"}),
+    ).save(latest)
+    source = snap("primary", [field], [vm("RHEL8", {"Owner": "different"}, path=original_vm.path)])
+    target = snap("secondary", [field], [vm("recovered", {"Owner": "latest"})])
+    managers = wire_snapshots(monkeypatch, {"primary": source, "secondary": target})
+    managers["secondary"].field = [
+        SimpleNamespace(name="Owner", key=7, managedObjectType=None),
+    ]
+    monkeypatch.setenv("VCENTER_CLEANUP_PASSWORD", "cleanup-password")
+    args = [
+        "restore", "--vcenter", "primary", "--user", "restore-user",
+        "--backup", str(latest), "--original-backup", str(original),
+        "--delete-target-definitions", "--cleanup-vcenter", "secondary",
+        "--cleanup-user", "cleanup-user", "--backup-dir", str(tmp_path),
+        "--apply", "--yes",
+    ]
+    assert main(args) == 3
+    assert managers["secondary"].removed_keys == []

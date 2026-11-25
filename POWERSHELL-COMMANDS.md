@@ -91,6 +91,32 @@ values, include `--overwrite` in both the preview and apply. Restoring a backup
 does not delete values or definitions that are absent from it. These examples
 verify vCenter certificates by default; see section 3 for the lab certificate option.
 
+If policy requires the failover target's Global definitions to be removed after
+failback succeeds, add the explicit cleanup options to the restore command:
+
+```powershell
+.\.venv\Scripts\python.exe -m vcattr restore --vcenter $sourceVcenter --user $sourceUser --backup $valuesBackup --original-backup .\backups\original-vm.json --insecure --apply --overwrite --delete-target-definitions --cleanup-vcenter $targetVcenter --cleanup-user $targetUser --cleanup-insecure
+```
+
+Omit `--overwrite` if the reviewed plan does not require replacing source values.
+The cleanup backup/password use the `backups` folder and `VCENTER_CLEANUP_PASSWORD`
+by default; the CLI securely prompts if the variable is unset in an interactive
+PowerShell session. After the source restore succeeds, the tool saves a full
+backup of the target and requires a **second** confirmation: type the exact target
+vCenter address. Only then does it delete Global definitions whose names appear
+in the original VM backup.
+
+This deletion is site-wide, not VM-scoped: vCenter removes each Global
+definition and its values from every target object, including values that
+existed before failover. Definitions are not tracked by ownership, so matching
+pre-existing definitions are deleted too. The safety backup contains the target
+inventory values and definitions, but restoration is a separate manual operation.
+Do not enable this cleanup if any target VM or administrator still needs those
+attributes. If restore has unresolved conflicts/unmatched objects, target
+connection fails, safety backup cannot be saved, or cleanup is not confirmed,
+definitions are left in place. If deletion partially fails, the command reports
+each error and the saved target backup path.
+
 ## 1. Download the project and create the environment
 
 Run once from a folder where you want the project stored:

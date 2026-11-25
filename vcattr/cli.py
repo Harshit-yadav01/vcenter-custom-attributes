@@ -100,6 +100,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--original-backup", type=Path,
         help="single-VM backup identifying the original VM to restore to",
     )
+    p.add_argument(
+        "--delete-target-definitions", action="store_true",
+        help="after a successful single-VM restore, delete its Global definitions from the target "
+             "vCenter (also removes these fields/values from every object there)",
+    )
+    p.add_argument(
+        "--cleanup-vcenter",
+        help="target vCenter to clean up; must match the source recorded in --backup",
+    )
+    p.add_argument("--cleanup-user", help="username for the target definition cleanup connection")
+    p.add_argument("--cleanup-port", type=int, default=443, help="cleanup target vCenter port")
+    p.add_argument(
+        "--cleanup-password-env", default="VCENTER_CLEANUP_PASSWORD", metavar="VAR",
+        help="environment variable for cleanup target password (default VCENTER_CLEANUP_PASSWORD)",
+    )
+    p.add_argument(
+        "--cleanup-insecure", action="store_true",
+        help="do not verify the cleanup target vCenter certificate",
+    )
 
     p = sub.add_parser("show", help="print what a backup file contains")
     p.add_argument("backup", type=Path)
@@ -158,6 +177,32 @@ def cmd_backup(args) -> int:
 def cmd_apply(args) -> int:
     from vcattr import vcenter
 
+    cleanup_enabled = getattr(args, "delete_target_definitions", False)
+    if cleanup_enabled and args.command != "restore":
+        raise ValueError("--delete-target-definitions is only available with restore.")
+    if cleanup_enabled and (
+        not getattr(args, "original_backup", None)
+        or not getattr(args, "cleanup_vcenter", None)
+        or not getattr(args, "cleanup_user", None)
+    ):
+        raise ValueError(
+            "--delete-target-definitions requires --original-backup, --cleanup-vcenter, "
+            "and --cleanup-user."
+        )
+    if cleanup_enabled and args.apply:
+        if not args.yes and not sys.stdin.isatty():
+            print(
+                "Refusing failback with target cleanup without a terminal. "
+                "Run interactively or add --yes."
+            )
+            return 1
+        if not sys.stdin.isatty() and not os.environ.get(args.cleanup_password_env):
+            print(
+                f"Set {args.cleanup_password_env} before failback cleanup when running "
+                "without a terminal."
+            )
+            return 1
+
     types = resolve_types(args.types)
     original_path = getattr(args, "original_backup", None)
     vm_mode = args.vm is not None or original_path is not None
@@ -198,6 +243,22 @@ def cmd_apply(args) -> int:
             )
         backup = backup.filtered(types)
         source_description = f"Backup: {args.backup} (taken {backup.taken_at} from {backup.vcenter})"
+    if cleanup_enabled:
+        if not backup.vm_scoped:
+            raise ValueError("--delete-target-definitions requires a single-VM backup.")
+        if original is None:
+            raise ValueError("--delete-target-definitions requires --original-backup.")
+        if args.cleanup_vcenter.casefold() != backup.vcenter.casefold():
+            raise ValueError(
+                f"--cleanup-vcenter must match the backup source {backup.vcenter!r}."
+            )
+        if args.cleanup_vcenter.casefold() == args.vcenter.casefold():
+            raise ValueError("Cleanup target must be different from the restore destination.")
+        if any(field.type is not None for field in [*backup.fields, *original.fields]):
+            raise ValueError(
+                "--delete-target-definitions only removes Global definitions; "
+                "one of the selected VM backups contains object-specific definitions."
+            )
     name_map = load_name_map(args.name_map)
 
     si = vcenter.connect(
@@ -226,19 +287,31 @@ def cmd_apply(args) -> int:
         print(source_description)
         print(plan.to_text(verbose=args.verbose))
         print()
+        if cleanup_enabled:
+            print(
+                f"After a successful restore, cleanup will delete these Global definitions "
+                f"from {args.cleanup_vcenter}: "
+                f"{', '.join(field.name for field in original.fields) or '(none)'}"
+            )
+            print(
+                "WARNING: deleting a Global definition removes that attribute and its values "
+                "from every object on the cleanup vCenter, including values that existed "
+                "before this tool was used."
+            )
 
         if not plan.has_changes:
             if plan.has_problems:
                 print("Nothing can be changed automatically. Check the conflicts and unmatched "
                       "objects above (--overwrite, --name-map).")
                 return 3
-            print(f"{args.vcenter} already carries every attribute in the backup. Nothing to do.")
-            return 0
+            print(f"{args.vcenter} already carries every attribute in the backup. Nothing to restore.")
+            if not cleanup_enabled:
+                return 0
         if not args.apply:
             print(f"This was a plan only. Run again with --apply to make the {args.command} changes.")
             return 0
 
-        if not args.yes:
+        if plan.has_changes and not args.yes:
             if not sys.stdin.isatty():
                 print("Refusing to apply without a terminal. Add --yes to confirm.")
                 return 1
@@ -250,11 +323,13 @@ def cmd_apply(args) -> int:
                 print("Not confirmed. Nothing was changed.")
                 return 1
 
-        safety = args.backup_dir / f"{_safe(args.vcenter)}-before-{args.command}-{_stamp()}.json"
-        safety_snapshot.save(safety)
-        print(f"Saved the target's current attributes to {safety} (use it with restore to undo).")
-
-        result = vcenter.apply_plan(si, plan, target)
+        if plan.has_changes:
+            safety = args.backup_dir / f"{_safe(args.vcenter)}-before-{args.command}-{_stamp()}.json"
+            safety_snapshot.save(safety)
+            print(f"Saved the target's current attributes to {safety} (use it with restore to undo).")
+            result = vcenter.apply_plan(si, plan, target)
+        else:
+            result = vcenter.ApplyResult()
     finally:
         vcenter.disconnect(si)
 
@@ -267,6 +342,71 @@ def cmd_apply(args) -> int:
     if plan.has_problems:
         print("Some items were not changed: see the conflicts and unmatched objects above.")
         return 3
+    if cleanup_enabled:
+        try:
+            cleanup_si = vcenter.connect(
+                args.cleanup_vcenter, args.cleanup_user,
+                _password(
+                    args.cleanup_password_env, args.cleanup_user, args.cleanup_vcenter,
+                ),
+                args.cleanup_port, args.cleanup_insecure,
+            )
+        except vcenter.VCenterError as exc:
+            print(
+                f"\nSource restore succeeded, but target cleanup could not connect to "
+                f"{args.cleanup_vcenter}; its definitions remain: {exc}",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            try:
+                cleanup_snapshot = vcenter.read_snapshot(cleanup_si, args.cleanup_vcenter, None)
+                cleanup_backup = (
+                    args.backup_dir
+                    / f"{_safe(args.cleanup_vcenter)}-before-definition-cleanup-{_stamp()}.json"
+                )
+                cleanup_snapshot.save(cleanup_backup)
+            except (OSError, ValueError, vcenter.VCenterError, vcenter.vmodl.MethodFault) as exc:
+                print(
+                    f"\nSource restore succeeded, but target cleanup stopped before deletion: {exc}",
+                    file=sys.stderr,
+                )
+                return 2
+            print(f"Saved a full cleanup-target backup to {cleanup_backup}.")
+            if not args.yes:
+                if not sys.stdin.isatty():
+                    print(
+                        "Refusing to delete Global definitions without a terminal. "
+                        "Run interactively or add --yes to confirm."
+                    )
+                    return 1
+                try:
+                    answer = input(
+                        f"Type the cleanup target vCenter name ({args.cleanup_vcenter}) "
+                        "to delete the definitions globally: "
+                    ).strip()
+                except EOFError:
+                    answer = ""
+                if answer != args.cleanup_vcenter:
+                    print("Not confirmed. The restored source was unchanged; target definitions remain.")
+                    return 1
+            removal = vcenter.remove_global_definitions(
+                cleanup_si, [field.name for field in original.fields],
+            )
+        finally:
+            vcenter.disconnect(cleanup_si)
+        if removal.errors:
+            print(f"\nRestore succeeded but cleanup had {len(removal.errors)} error(s):")
+            for error in removal.errors:
+                print(f"  {error}")
+            print(f"Full cleanup-target backup: {cleanup_backup}")
+            return 2
+        print(
+            f"Cleanup complete: deleted {len(removal.removed)} Global definition(s) "
+            f"from {args.cleanup_vcenter}."
+        )
+        if removal.missing:
+            print(f"{len(removal.missing)} definition(s) were already absent.")
     return 0
 
 

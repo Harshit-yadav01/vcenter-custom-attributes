@@ -151,6 +151,13 @@ class ApplyResult:
     errors: list[str] = field(default_factory=list)
 
 
+@dataclass
+class DefinitionRemovalResult:
+    removed: list[str] = field(default_factory=list)
+    missing: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+
 def apply_plan(si, plan: Plan, target: Snapshot, progress=print) -> ApplyResult:
     """Create the missing attribute definitions, then set each planned value. Keeps going on errors."""
     manager = si.RetrieveContent().customFieldsManager
@@ -190,6 +197,29 @@ def apply_plan(si, plan: Plan, target: Snapshot, progress=print) -> ApplyResult:
         except Exception as exc:  # noqa: BLE001 - record and continue with the next item
             result.errors.append(f"{v.type} {v.target.name}: set {v.field}: {_fault_text(exc)}")
     progress(f"  set {result.set} value(s)")
+    return result
+
+
+def remove_global_definitions(si, names: list[str], progress=print) -> DefinitionRemovalResult:
+    """Remove only named Global definitions. This deletes their values across the vCenter."""
+    manager = si.RetrieveContent().customFieldsManager
+    result = DefinitionRemovalResult()
+    definitions = {f.name: f for f in manager.field or []}
+    for name in names:
+        definition = definitions.get(name)
+        if definition is None:
+            result.missing.append(name)
+            progress(f"  attribute {name} is already absent")
+            continue
+        if definition.managedObjectType is not None:
+            result.errors.append(f"remove attribute {name}: target definition is not Global")
+            continue
+        try:
+            manager.RemoveCustomFieldDef(key=definition.key)
+            result.removed.append(name)
+            progress(f"  deleted Global attribute {name}")
+        except Exception as exc:  # noqa: BLE001 - record and continue with remaining definitions
+            result.errors.append(f"remove attribute {name}: {_fault_text(exc)}")
     return result
 
 

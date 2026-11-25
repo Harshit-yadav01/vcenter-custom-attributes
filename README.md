@@ -99,6 +99,15 @@ restore one of its own backups to it.
 As with `failover`, `restore` can use `--source-vcenter` and `--source-user` instead of `--backup`
 to read from a reachable source vCenter.
 
+For the single-VM workflow, you can explicitly delete the backed-up Global definitions from the
+failover target after a successful restore by adding `--delete-target-definitions`,
+`--cleanup-vcenter <target>`, and `--cleanup-user <user>` to `restore`. Before deletion, the tool
+saves a full target backup and asks for a separate confirmation. This is vCenter-wide: every value
+for those Global definitions is removed from every object, including values that existed before
+failover and definitions that predated this workflow. Use this only when site-wide removal is
+intended. The safety backup can be used in a separate manual restore; deletion is not automatically
+reversible.
+
 ## How it decides what to change
 
 - **Attribute definitions** missing on the target are created with the same name and object type.
