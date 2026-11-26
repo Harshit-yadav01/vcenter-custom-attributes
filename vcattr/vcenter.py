@@ -200,26 +200,45 @@ def apply_plan(si, plan: Plan, target: Snapshot, progress=print) -> ApplyResult:
     return result
 
 
-def remove_global_definitions(si, names: list[str], progress=print) -> DefinitionRemovalResult:
-    """Remove only named Global definitions. This deletes their values across the vCenter."""
+def remove_definitions(
+    si, fields: list[FieldDef], safety_snapshot: Snapshot, progress=print,
+) -> DefinitionRemovalResult:
+    """Remove requested definitions only if their type and saved identity still match."""
     manager = si.RetrieveContent().customFieldsManager
     result = DefinitionRemovalResult()
     definitions = {f.name: f for f in manager.field or []}
-    for name in names:
-        definition = definitions.get(name)
+    saved = {f.name: f for f in safety_snapshot.fields}
+    to_remove = []
+    for expected in fields:
+        definition = definitions.get(expected.name)
         if definition is None:
-            result.missing.append(name)
-            progress(f"  attribute {name} is already absent")
+            result.missing.append(expected.name)
             continue
-        if definition.managedObjectType is not None:
-            result.errors.append(f"remove attribute {name}: target definition is not Global")
+        actual_type = _type_name(definition.managedObjectType) if definition.managedObjectType else None
+        if actual_type != expected.type:
+            result.errors.append(
+                f"remove attribute {expected.name}: target type is {actual_type or 'Global'}, "
+                f"expected {expected.type or 'Global'}"
+            )
             continue
+        saved_field = saved.get(expected.name)
+        if saved_field is None or saved_field.key != definition.key or saved_field.type != actual_type:
+            result.errors.append(
+                f"remove attribute {expected.name}: definition changed since the safety backup"
+            )
+            continue
+        to_remove.append(definition)
+    if result.errors:
+        return result
+    for name in result.missing:
+        progress(f"  attribute {name} is already absent")
+    for definition in to_remove:
         try:
             manager.RemoveCustomFieldDef(key=definition.key)
-            result.removed.append(name)
-            progress(f"  deleted Global attribute {name}")
+            result.removed.append(definition.name)
+            progress(f"  deleted attribute {definition.name}")
         except Exception as exc:  # noqa: BLE001 - record and continue with remaining definitions
-            result.errors.append(f"remove attribute {name}: {_fault_text(exc)}")
+            result.errors.append(f"remove attribute {definition.name}: {_fault_text(exc)}")
     return result
 
 

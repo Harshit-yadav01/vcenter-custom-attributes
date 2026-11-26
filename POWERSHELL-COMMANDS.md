@@ -91,26 +91,34 @@ values, include `--overwrite` in both the preview and apply. Restoring a backup
 does not delete values or definitions that are absent from it. These examples
 verify vCenter certificates by default; see section 3 for the lab certificate option.
 
-If policy requires the failover target's Global definitions to be removed after
-failback succeeds, add the explicit cleanup options to the restore command:
+If policy requires the failover target's Global and VM-specific definitions
+to be removed after failback succeeds, add the explicit cleanup options:
 
 ```powershell
-.\.venv\Scripts\python.exe -m vcattr restore --vcenter $sourceVcenter --user $sourceUser --backup $valuesBackup --original-backup .\backups\original-vm.json --insecure --apply --overwrite --delete-target-definitions --cleanup-vcenter $targetVcenter --cleanup-user $targetUser --cleanup-insecure
+.\.venv\Scripts\python.exe -m vcattr restore --vcenter $sourceVcenter --user $sourceUser --backup $valuesBackup --original-backup .\backups\original-vm.json --insecure --delete-target-definitions --cleanup-vcenter $targetVcenter --cleanup-user $targetUser --cleanup-insecure
 ```
 
-Omit `--overwrite` if the reviewed plan does not require replacing source values.
+This is a preview. Review the restore and deletion lists, then rerun with
+`--apply`. Add `--overwrite` to both commands only when the reviewed plan
+requires replacing source values and you approve it.
 The cleanup backup/password use the `backups` folder and `VCENTER_CLEANUP_PASSWORD`
 by default; the CLI securely prompts if the variable is unset in an interactive
 PowerShell session. After the source restore succeeds, the tool saves a full
 backup of the target and requires a **second** confirmation: type the exact target
-vCenter address. Only then does it delete Global definitions whose names appear
-in the original VM backup.
+vCenter address. If the source already matches, there is no source confirmation,
+but target deletion still requires its own confirmation. Only then does it delete
+definitions listed in either VM backup whose target type matches. A type mismatch
+or a definition change since the safety snapshot stops all deletions.
 
-This deletion is site-wide, not VM-scoped: vCenter removes each Global
-definition and its values from every target object, including values that
+This deletion is site-wide, not VM-scoped: vCenter removes each definition
+and its values from all applicable target objects, including values that
 existed before failover. Definitions are not tracked by ownership, so matching
-pre-existing definitions are deleted too. The safety backup contains the target
-inventory values and definitions, but restoration is a separate manual operation.
+pre-existing definitions are deleted too. The target inventory backup is limited
+to accessible objects and types supported by the tool; restoration is a separate
+manual operation and may not be complete.
+An attribute present in the original VM backup but missing from the selected
+restore backup is **not restored to the source**, even though its target definition
+is included in cleanup; the preview warns about these attributes.
 Do not enable this cleanup if any target VM or administrator still needs those
 attributes. If restore has unresolved conflicts/unmatched objects, target
 connection fails, safety backup cannot be saved, or cleanup is not confirmed,
@@ -322,5 +330,6 @@ backup to the original site after its VMs have been recovered there. Preview fir
 
 Restoring a target's pre-apply safety backup with `--overwrite` can restore
 overwritten values. **It is not an exact rollback:** definitions created by
-the operation and newly added values remain because the tool never deletes them.
+the operation and newly added values remain because ordinary restore does not delete
+them. The optional target definition cleanup is destructive as described above.
 VM failback, reprotection, and VM rollback are separate SRM operations.

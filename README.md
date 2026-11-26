@@ -99,14 +99,16 @@ restore one of its own backups to it.
 As with `failover`, `restore` can use `--source-vcenter` and `--source-user` instead of `--backup`
 to read from a reachable source vCenter.
 
-For the single-VM workflow, you can explicitly delete the backed-up Global definitions from the
-failover target after a successful restore by adding `--delete-target-definitions`,
+For the single-VM workflow, you can explicitly delete the backed-up Global and VM-specific
+definitions from the failover target after a successful restore by adding `--delete-target-definitions`,
 `--cleanup-vcenter <target>`, and `--cleanup-user <user>` to `restore`. Before deletion, the tool
-saves a full target backup and asks for a separate confirmation. This is vCenter-wide: every value
-for those Global definitions is removed from every object, including values that existed before
-failover and definitions that predated this workflow. Use this only when site-wide removal is
-intended. The safety backup can be used in a separate manual restore; deletion is not automatically
-reversible.
+saves a target inventory backup and asks for a separate confirmation. Definitions in either the
+original or restore backup are included, even if an original value is missing from the restore
+backup. This is vCenter-wide: every value for those definitions is removed from every applicable
+object, including values that existed before failover and definitions that predated this workflow.
+Use this only when site-wide removal is intended. A target type mismatch stops deletion. The safety
+backup is limited to objects and values accessible to the account and the types supported by the
+tool; recovery is a separate manual operation and may not be complete.
 
 ## How it decides what to change
 
@@ -128,7 +130,8 @@ reversible.
 
 - **Values that already exist** on the target with a different value are reported as conflicts and
   kept. Add `--overwrite` to replace them with the backup value.
-- **Values on the target that are not in the backup are never removed.**
+- Ordinary backup and restore do not remove values absent from the backup. Explicit
+  `--delete-target-definitions` cleanup removes definitions and their values vCenter-wide.
 - `--types vm,host,cluster` limits any command to some object types. Accepted names: `vm`, `host`,
   `cluster`, `computeresource`, `datastore`, `datastorecluster`, `datacenter`, `folder`,
   `resourcepool`, `vapp`, `network`, `portgroup`, `dvswitch`, or a vSphere type name such as
@@ -140,7 +143,8 @@ reversible.
 - With `--apply`, the target's current attributes are first saved to
   `backups/<vcenter>-before-<command>-<time>.json`. Restoring that file with `--overwrite` puts
   back any value that was overwritten. Attribute definitions that were created, and values added
-  where there was none, stay: the tool never deletes.
+  where there was none, stay: ordinary restore does not delete. The optional target definition
+  cleanup is destructive as described above.
 - One failed object does not stop the run. Every error is listed at the end.
 
 ## Permissions

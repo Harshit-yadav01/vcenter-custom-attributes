@@ -102,8 +102,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--delete-target-definitions", action="store_true",
-        help="after a successful single-VM restore, delete its Global definitions from the target "
-             "vCenter (also removes these fields/values from every object there)",
+        help="after a successful single-VM restore, delete definitions in either backup from "
+             "the cleanup vCenter (removes their values from all applicable objects there)",
     )
     p.add_argument(
         "--cleanup-vcenter",
@@ -254,11 +254,16 @@ def cmd_apply(args) -> int:
             )
         if args.cleanup_vcenter.casefold() == args.vcenter.casefold():
             raise ValueError("Cleanup target must be different from the restore destination.")
-        if any(field.type is not None for field in [*backup.fields, *original.fields]):
-            raise ValueError(
-                "--delete-target-definitions only removes Global definitions; "
-                "one of the selected VM backups contains object-specific definitions."
-            )
+        cleanup_fields = {field.name: field for field in original.fields}
+        for field in backup.fields:
+            existing = cleanup_fields.get(field.name)
+            if existing is not None and existing.type != field.type:
+                raise ValueError(
+                    f"Cannot clean up {field.name!r}: definition types differ between backups."
+                )
+            cleanup_fields[field.name] = field
+        if any(field.type not in (None, "VirtualMachine") for field in cleanup_fields.values()):
+            raise ValueError("Cleanup supports only Global and VirtualMachine definitions.")
     name_map = load_name_map(args.name_map)
 
     si = vcenter.connect(
@@ -289,13 +294,20 @@ def cmd_apply(args) -> int:
         print()
         if cleanup_enabled:
             print(
-                f"After a successful restore, cleanup will delete these Global definitions "
-                f"from {args.cleanup_vcenter}: "
-                f"{', '.join(field.name for field in original.fields) or '(none)'}"
+                f"After a successful restore, cleanup will delete these definitions "
+                f"from {args.cleanup_vcenter}:"
             )
+            for field in cleanup_fields.values():
+                print(f"  {field.name} [{field.type or 'Global'}]")
+            missing_values = original.objects[0].values.keys() - backup.objects[0].values.keys()
+            if missing_values:
+                print(
+                    "WARNING: these original VM attributes are not in the restore backup "
+                    f"and will not be restored: {', '.join(sorted(missing_values))}"
+                )
             print(
-                "WARNING: deleting a Global definition removes that attribute and its values "
-                "from every object on the cleanup vCenter, including values that existed "
+                "WARNING: deleting a definition removes that attribute and its values "
+                "from all applicable objects on the cleanup vCenter, including values that existed "
                 "before this tool was used."
             )
 
@@ -376,22 +388,22 @@ def cmd_apply(args) -> int:
             if not args.yes:
                 if not sys.stdin.isatty():
                     print(
-                        "Refusing to delete Global definitions without a terminal. "
+                        "Refusing to delete definitions without a terminal. "
                         "Run interactively or add --yes to confirm."
                     )
                     return 1
                 try:
                     answer = input(
                         f"Type the cleanup target vCenter name ({args.cleanup_vcenter}) "
-                        "to delete the definitions globally: "
+                        "to delete the definitions across the vCenter: "
                     ).strip()
                 except EOFError:
                     answer = ""
                 if answer != args.cleanup_vcenter:
                     print("Not confirmed. The restored source was unchanged; target definitions remain.")
                     return 1
-            removal = vcenter.remove_global_definitions(
-                cleanup_si, [field.name for field in original.fields],
+            removal = vcenter.remove_definitions(
+                cleanup_si, list(cleanup_fields.values()), cleanup_snapshot,
             )
         finally:
             vcenter.disconnect(cleanup_si)
@@ -402,7 +414,7 @@ def cmd_apply(args) -> int:
             print(f"Full cleanup-target backup: {cleanup_backup}")
             return 2
         print(
-            f"Cleanup complete: deleted {len(removal.removed)} Global definition(s) "
+            f"Cleanup complete: deleted {len(removal.removed)} definition(s) "
             f"from {args.cleanup_vcenter}."
         )
         if removal.missing:
